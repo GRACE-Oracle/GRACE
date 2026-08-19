@@ -1,0 +1,56 @@
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+Sample = tuple[list[torch.Tensor], list[torch.Tensor]]
+
+
+class TabularDataset(Dataset):
+    """Tabular dataset yielding `(features, labels)` as lists of tensors."""
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        *,
+        num_cols: list[str] | None = None,
+        cat_cols: list[str] | None = None,
+        label_col: str | list[str] | None = None,
+    ) -> None:
+        if not num_cols and not cat_cols:
+            raise ValueError("At least one of num_cols or cat_cols must be provided.")
+
+        self.numerical_features = (
+            torch.as_tensor(df[num_cols].values.copy(), dtype=torch.float32)
+            if num_cols
+            else None
+        )
+        self.categorical_features = (
+            torch.as_tensor(df[cat_cols].values.copy(), dtype=torch.long)
+            if cat_cols
+            else None
+        )
+
+        if label_col is not None:
+            label_cols = [label_col] if isinstance(label_col, str) else list(label_col)
+            self.labels: list[torch.Tensor] | None = [
+                torch.as_tensor(df[col].values.copy(), dtype=torch.long)
+                for col in label_cols
+            ]
+        else:
+            self.labels = None
+
+        self._length = len(df)
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int) -> Sample:
+        features = [
+            t[index]
+            for t in (self.numerical_features, self.categorical_features)
+            if t is not None
+        ]
+        labels = (
+            [t[index] for t in self.labels] if self.labels is not None else features
+        )
+        return features, labels
