@@ -1,0 +1,8 @@
+name: focal_loss
+
+params:
+  gamma: 2.0
+  class_weight: null
+  reduction: mean
+  ignore_index: -1
+  label_smoothing: 0.1

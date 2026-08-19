@@ -1,0 +1,436 @@
+import logging
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from omegaconf import OmegaConf
+from sklearn.preprocessing import RobustScaler
+from tqdm import tqdm
+
+from src.core.config import load_config, save_config
+from src.core.io import load_df, save_df
+from src.core.log import (
+    JSONSubscriber,
+    LogBundle,
+    LogDispatcher,
+    setup_logger,
+)
+from src.core.utils import flush_timing, skip_if_exists, timed
+from src.domain.analysis.complexity.shared import l2_normalize
+from src.domain.analysis.metadata import (
+    compute_clusters_metadata,
+    compute_df_metadata,
+    get_df_info,
+)
+from src.domain.clustering import build_cluster_fn, resolution_aware_floor
+from src.domain.clustering.base import (
+    assign_clusters_within_class,
+    assign_nearest_centroid,
+    cluster_size_balance,
+)
+from src.domain.data.preprocessing import (
+    LogTransformer,
+    TopNHashEncoder,
+    build_preprocessor,
+    drop_nans,
+    encode_labels,
+    ml_split,
+    query_filter,
+    rare_category_filter,
+)
+
+setup_logger(log_file="resources/logs.txt")
+logger = logging.getLogger(__name__)
+
+
+def _absorb_small_clusters(
+    labels: np.ndarray, floor: int
+) -> tuple[np.ndarray, int, int]:
+    """Turn clusters smaller than `floor` back into noise."""
+    ids, counts = np.unique(labels[labels != -1], return_counts=True)
+    small = ids[counts < floor]
+    if small.size == 0:
+        return labels, 0, 0
+    mask = np.isin(labels, small)
+    return np.where(mask, -1, labels), int(small.size), int(mask.sum())
+
+
+def _cluster_per_class(
+    X_num: np.ndarray,
+    y_class: np.ndarray,
+    classes: list,
+    *,
+    X_cat: np.ndarray | None = None,
+    algorithms: dict[str, dict],
+    max_fit_samples: int,
+    random_state: int,
+    metric: str = "euclidean",
+    min_cluster_floor: int = 50,
+    min_clusters: int | None = None,
+    max_clusters_total: int | None = None,
+    grid_target_cluster_size: int | None = None,
+    resolution_weight: float = 0.1,
+) -> tuple[np.ndarray, dict[int, np.ndarray], set[int], dict[str, dict]]:
+    """Cluster each class separately, folding noise into per-class pseudo-clusters."""
+    n = X_num.shape[0]
+    max_clusters_per_class = (
+        max(2, max_clusters_total // len(classes))
+        if max_clusters_total is not None
+        else None
+    )
+    labels = np.full(n, -1, dtype=np.int64)
+    centroids: dict[int, np.ndarray] = {}
+    offset = 0
+    report: dict[str, dict] = {}
+
+    for cls in tqdm(classes, desc="Clustering classes"):
+        mask = y_class == cls
+        if not mask.any():
+            continue
+        X_num_cls = X_num[mask]
+        X_num_cls = l2_normalize(X_num_cls) if metric == "cosine" else X_num_cls
+        X_cat_cls = X_cat[mask] if X_cat is not None else None
+
+        algo_reports: dict[str, dict] = {}
+        cluster_fn = build_cluster_fn(
+            algorithms=algorithms,
+            max_fit_samples=max_fit_samples,
+            random_state=random_state,
+            reporter=algo_reports.__setitem__,
+            metric=metric,
+            max_clusters=max_clusters_per_class,
+            min_clusters=min_clusters,
+            grid_target_cluster_size=grid_target_cluster_size,
+            resolution_weight=resolution_weight,
+        )
+        raw_labels = cluster_fn(X_num_cls, X_cat_cls)
+        effective_floor = (
+            resolution_aware_floor(
+                X_num_cls.shape[0], grid_target_cluster_size, min_cluster_floor
+            )
+            if grid_target_cluster_size
+            else min_cluster_floor
+        )
+        raw_labels, n_floor_clusters, n_floor_points = _absorb_small_clusters(
+            raw_labels, effective_floor
+        )
+
+        n_cls = int(raw_labels.shape[0])
+        n_noise_cls = int((raw_labels == -1).sum())
+        report[str(cls)] = {
+            "n_samples": n_cls,
+            "algorithms": algo_reports,
+            "summary": {
+                "n_clusters": int(np.unique(raw_labels[raw_labels != -1]).size),
+                "n_noise": n_noise_cls,
+                "noise_ratio": n_noise_cls / n_cls if n_cls > 0 else 0.0,
+                "size_balance": cluster_size_balance(raw_labels),
+                "floor_used": effective_floor,
+                "floor_absorbed_clusters": n_floor_clusters,
+                "floor_absorbed_points": n_floor_points,
+            },
+        }
+
+        cluster_ids = np.unique(raw_labels[raw_labels != -1])
+        labels[mask] = np.where(raw_labels == -1, -1, raw_labels + offset)
+        X_raw_cls = X_num[mask]
+        for cid in cluster_ids:
+            centroids[int(cid + offset)] = X_raw_cls[raw_labels == cid].mean(axis=0)
+        del X_raw_cls
+        if len(cluster_ids) > 0:
+            offset += int(cluster_ids.max()) + 1
+
+    noise_cluster_ids: set[int] = set()
+    noise_count = int((labels == -1).sum())
+    if noise_count > 0:
+        next_id = max(centroids.keys(), default=-1) + 1
+        for noise_cls in sorted(np.unique(y_class)):
+            noise_mask = (y_class == noise_cls) & (labels == -1)
+            if noise_mask.any():
+                labels[noise_mask] = next_id
+                centroids[next_id] = X_num[noise_mask].mean(axis=0)
+                noise_cluster_ids.add(next_id)
+                next_id += 1
+
+    return labels, centroids, noise_cluster_ids, report
+
+
+@timed
+def preprocess_df(
+    df: pd.DataFrame,
+    num_cols: list[str],
+    cat_cols: list[str],
+    label_col: str,
+    filter_query: str | None,
+    min_cat_count: int,
+    train_frac: float,
+    val_frac: float,
+    test_frac: float,
+    random_state: int,
+    top_n: int,
+    hash_buckets: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Preprocess dataframe: filter, encode, scale, and split."""
+    logger.info(
+        "Preprocessing: %d rows, %d num_cols, %d cat_cols",
+        len(df),
+        len(num_cols),
+        len(cat_cols),
+    )
+    df = drop_nans(df, num_cols + cat_cols + [label_col])
+    df = query_filter(df, query=filter_query)
+    df = rare_category_filter(df, [label_col], min_count=min_cat_count)
+
+    train_df, val_df, test_df = ml_split(
+        df,
+        train_frac=train_frac,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        random_state=random_state,
+        label_col=label_col,
+    )
+    logger.info(
+        "Split sizes — train: %d, val: %d, test: %d",
+        len(train_df),
+        len(val_df),
+        len(test_df),
+    )
+
+    preprocessor = build_preprocessor(
+        num_cols=num_cols,
+        cat_cols=cat_cols,
+        num_steps=[
+            ("log_transformer", LogTransformer()),
+            ("scaler", RobustScaler()),
+        ],
+        cat_steps=[
+            ("top_n_encoder", TopNHashEncoder(top_n=top_n, hash_buckets=hash_buckets)),
+        ],
+    )
+    logger.info("Preprocessor: %s", preprocessor)
+    preprocessor.fit(train_df)
+    train_df, val_df, test_df = (
+        preprocessor.transform(split) for split in [train_df, val_df, test_df]
+    )
+
+    return train_df, val_df, test_df
+
+
+def _cluster_splits(
+    cfg,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    num_cols: list[str],
+    cat_cols: list[str],
+    label_col: str,
+    dispatcher: LogDispatcher,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict, set[int]]:
+    """Cluster train per class, then attach the `cluster` column to every split."""
+    X_num = train_df[num_cols].to_numpy(dtype=np.float64)
+    X_cat = train_df[cat_cols].to_numpy() if cat_cols else None
+    y_class = train_df[label_col].to_numpy()
+    all_classes = sorted(train_df[label_col].unique().tolist())
+
+    logger.info("Running per-class clustering on train (n=%d)...", len(train_df))
+    algorithms = OmegaConf.to_container(cfg.clustering.algorithms, resolve=True)
+    max_clusters_total = (
+        cfg.complexity.max_complexity_samples
+        // cfg.complexity.min_subsample_per_cluster
+    )
+    labels, centroids, noise_cluster_ids, clustering_report = _cluster_per_class(
+        X_num,
+        y_class,
+        all_classes,
+        X_cat=X_cat,
+        algorithms=algorithms,
+        max_fit_samples=cfg.clustering.max_fit_samples,
+        random_state=cfg.seed,
+        metric=cfg.clustering.distance,
+        min_cluster_floor=cfg.clustering.min_cluster_floor,
+        min_clusters=cfg.clustering.min_clusters,
+        max_clusters_total=max_clusters_total,
+        grid_target_cluster_size=cfg.clustering.grid_target_cluster_size,
+        resolution_weight=cfg.clustering.resolution_weight,
+    )
+    dispatcher.publish(
+        LogBundle.from_dict({"json/clustering_report": clustering_report})
+    )
+
+    cluster_to_class = {
+        int(cid): y_class[labels == cid][0] for cid in np.unique(labels)
+    }
+
+    train_df = train_df.copy()
+    train_df["cluster"] = labels
+    assigned: dict[str, pd.DataFrame] = {}
+    for name, split_df in (("val", val_df), ("test", test_df)):
+        split_df = split_df.copy()
+        if cfg.label_free_assignment:
+            split_df["cluster"] = assign_nearest_centroid(
+                split_df[num_cols].to_numpy(dtype=np.float64),
+                centroids,
+                metric=cfg.clustering.distance,
+            )
+        else:
+            split_df["cluster"] = assign_clusters_within_class(
+                split_df[num_cols].to_numpy(dtype=np.float64),
+                split_df[label_col].to_numpy(),
+                centroids,
+                cluster_to_class,
+                metric=cfg.clustering.distance,
+            )
+        assigned[name] = split_df
+    val_df, test_df = assigned["val"], assigned["test"]
+
+    noise_ids = sorted(noise_cluster_ids)
+    noise_count = (
+        sum(
+            int(np.isin(df["cluster"], noise_ids).sum())
+            for df in (train_df, val_df, test_df)
+        )
+        if noise_ids
+        else 0
+    )
+    logger.info(
+        "Clustering complete — %d clusters (noise reassigned: %d points into pseudo-clusters)",
+        len(centroids),
+        noise_count,
+    )
+    return train_df, val_df, test_df, centroids, noise_cluster_ids
+
+
+def _publish_metadata(
+    cfg,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    num_cols: list[str],
+    cat_cols: list[str],
+    label_col: str,
+    label_mapping: dict,
+    centroids: dict,
+    noise_cluster_ids: set[int],
+    dispatcher: LogDispatcher,
+) -> dict:
+    """Compute and publish dataset + cluster metadata; returns df_meta."""
+    logger.info("Computing and saving metadata...")
+    metadata = compute_df_metadata(
+        {"train": train_df, "val": val_df, "test": test_df},
+        label_col,
+        num_cols,
+        cat_cols,
+        cfg.data.benign_tag,
+        label_mapping=label_mapping,
+    )
+    dispatcher.publish(LogBundle.from_dict({"json/df_meta": metadata}))
+
+    clusters_metadata = compute_clusters_metadata(
+        train_df,
+        val_df,
+        test_df,
+        label_col,
+        cluster_col="cluster",
+        centroids={str(k): v.tolist() for k, v in centroids.items()},
+        noise_cluster_ids=sorted(noise_cluster_ids),
+    )
+    dispatcher.publish(LogBundle.from_dict({"json/clusters_meta": clusters_metadata}))
+    logger.info("Cluster metadata saved.")
+    return metadata
+
+
+@timed
+def prepare(cfg) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Preprocess, cluster and persist the train/val/test splits."""
+    num_cols = list(cfg.data.num_cols) if cfg.data.num_cols else []
+    cat_cols = list(cfg.data.cat_cols) if cfg.data.cat_cols else []
+    label_col = cfg.data.label_col
+
+    raw_data_path = Path(cfg.path.raw_data)
+    processed_data_path = Path(cfg.path.processed_data)
+    data_logs_path = Path(cfg.path.shared)
+
+    dispatcher = LogDispatcher()
+    dispatcher.subscribe(JSONSubscriber(data_logs_path / "metadata"))
+
+    logger.info("Loading and preprocessing data...")
+    df = load_df(str(raw_data_path))
+    logger.info("Raw data loaded: %d rows, %d columns", *df.shape)
+
+    df_info = get_df_info(df, label_col=label_col)
+    dispatcher.publish(LogBundle.from_dict({"json/df_info": df_info}))
+
+    train_df, val_df, test_df = preprocess_df(
+        df,
+        num_cols,
+        cat_cols,
+        label_col,
+        cfg.data.filter_query,
+        cfg.data.min_cat_count,
+        cfg.data.train_frac,
+        cfg.data.val_frac,
+        cfg.data.test_frac,
+        cfg.seed,
+        cfg.data.top_n,
+        cfg.data.hash_buckets,
+    )
+    train_df, val_df, test_df = (
+        df.reset_index(drop=True) for df in [train_df, val_df, test_df]
+    )
+
+    train_df, val_df, test_df, centroids, noise_cluster_ids = _cluster_splits(
+        cfg, train_df, val_df, test_df, num_cols, cat_cols, label_col, dispatcher
+    )
+
+    train_df, val_df, test_df, label_mapping = encode_labels(
+        train_df, val_df, test_df, label_col, dst_label_col=f"encoded_{label_col}"
+    )
+
+    logger.info("Saving processed data...")
+    for split_name, split_df in [
+        ("train", train_df),
+        ("val", val_df),
+        ("test", test_df),
+    ]:
+        save_df(split_df, processed_data_path / f"{split_name}.{cfg.data.extension}")
+
+    metadata = _publish_metadata(
+        cfg,
+        train_df,
+        val_df,
+        test_df,
+        num_cols,
+        cat_cols,
+        label_col,
+        label_mapping,
+        centroids,
+        noise_cluster_ids,
+        dispatcher,
+    )
+    return train_df, val_df, test_df, metadata
+
+
+def main() -> None:
+    """Entry point for the data preparation stage."""
+    cfg = load_config(
+        config_path=Path(__file__).parent.parent / "configs",
+        config_name="config",
+        overrides=sys.argv[1:],
+    )
+
+    ext = cfg.data.extension
+    processed = Path(cfg.path.processed_data)
+    shared = Path(cfg.path.shared)
+    markers = [processed / f"{s}.{ext}" for s in ("train", "val", "test")]
+    markers.append(shared / "metadata/clusters_meta.json")
+    if skip_if_exists(markers, cfg.prepare.force, "prepare"):
+        return
+
+    save_config(cfg, shared / "config_composed.json")
+    prepare(cfg)
+    flush_timing(shared / "timing.json")
+
+
+if __name__ == "__main__":
+    main()

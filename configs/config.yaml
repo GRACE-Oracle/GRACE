@@ -1,0 +1,79 @@
+defaults:
+  - data: cic_2018_v2
+  - classifier: tabular
+  - clustering: kmeans
+  - loss: focal             # consumed only by DL classifiers
+  - optimizer: adamw        # consumed only by DL classifiers
+  - scheduler: one_cycle    # consumed only by DL classifiers
+  - loops: default          # consumed only by DL classifiers
+  - _self_
+  - path: default
+
+seed: 42
+name: exp_euc
+device: cpu
+stage: all
+n_samples: null
+balance: undersample                 # training-set class balancing at training time: undersample | none
+distance: cosine                     # euclidean | cosine — single metric for clustering AND complexity analysis
+label_free_assignment: true          # val/test cluster routing: true = label-free (nearest centroid over all clusters, ignores class at inference) | false = label-aware (nearest centroid within own class)
+kfold: true                          # classifier evaluation: true = k-fold OOF over train+test (metrics + failure rates); false = single test split
+kfold_splits: 5                      # number of OOF folds when kfold=true
+
+testing:
+  figures: true                      # build testing figures (confusion matrix, F1 bar, t-SNE); set false for inference-only runs that need only test_samples.parquet
+
+grid_search:
+  enabled: true
+  scoring: f1_macro
+  cv: 5
+  max_samples: 50000
+
+prepare:
+  force: false                       # re-run preprocessing+clustering even if shared outputs exist
+
+complexity:
+  distance: ${distance}              # inherited from the top-level key — must match the clustering metric
+  k: 30
+  top_k_clusters: 10                 # top-K nearest adversarial clusters per cluster (vs-cluster aggregation)
+  min_subsample_per_cluster: 20      # min samples per cluster (measurement floor); keep ≤ clustering.min_cluster_floor
+  max_complexity_samples: 50000      # cap on points used to build the k-NN graph; iso-quality knee from the cost sweep (build is Θ(m²))
+  force: false                       # re-run complexity computation even if shared output exists
+
+failure_classifier:
+  reuse: false                       # reuse an existing classifier_results.json (skip the predictor re-fit) and only (re)compute instance baselines — for inference-only re-runs
+  min_test_support: 5                # clusters with fewer test samples are excluded from the failure dataset
+  n_outer_splits: 5
+  n_inner_splits: 5
+  significance: true                 # run the cluster-block bootstrap significance test; set false to skip it entirely (fastest — point estimates only)
+  n_bootstrap: 2000                  # cluster-level bootstrap resamples for the predictor-vs-confidence-baseline significance test (no re-training, no extra seeds)
+  max_bootstrap_samples: 20000       # cap on test samples fed to the instance-level bootstrap CI (point estimates always use full data); stratified per cluster so every cluster stays represented — the bootstrap's resampling unit is the cluster, so per-cluster depth can be shallow
+  param_grid:
+    n_estimators: [100, 200, 300, 500]
+    max_depth: [null, 3, 5, 10, 20]
+    min_samples_leaf: [1, 2, 3, 5]
+    max_features: [sqrt, 0.5]
+
+plots:
+  format: pdf                        # figure file format: pdf (vector, lighter) | png
+  max_class_pairs: 10
+  projection_max_samples: 5000
+  pair_projection_max_samples: 5000
+
+extend:
+  generate: false                    # opt-in: train an extra complexity-extended classifier + SHAP
+  force: false                       # re-run the SHAP stage even if shap_values.pkl exists
+  labelfree: false                   # nearest-centroid assignment across all clusters, ignoring class labels
+  num_samples: 200                   # test instances explained per run
+  background_samples: 100            # rows sampled before the k-means summarisation
+  background_summary_k: 25           # k-means centroids used as KernelExplainer background
+  nsamples: 200                      # coalition samples per explained instance (KernelExplainer)
+  max_display: 20                    # top features shown in the beeswarm
+
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: False
