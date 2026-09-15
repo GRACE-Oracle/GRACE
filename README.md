@@ -1,4 +1,4 @@
-# Intrusion Forge
+# GRACE
 
 A framework for finding out **where** a trained classifier fails, and **why**, without needing labelled test data for the regions in question.
 
