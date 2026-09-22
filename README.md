@@ -239,7 +239,7 @@ resources/experiments/${name}/${data.file_name}_${seed}/
 ## Repository layout
 
 ```
-intrusion-forge/
+GRACE/
 ├── pipelines/                    # entry points — own the config, I/O, logging and paths
 │   ├── prepare_data.py           #   preprocess + divide into regions
 │   ├── classify.py               #   train + evaluate one classifier
